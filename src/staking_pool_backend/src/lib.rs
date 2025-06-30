@@ -1,10 +1,10 @@
 use candid::{CandidType, Deserialize, Principal};
-use ic_cdk::{caller, trap};
+use ic_cdk::{caller, trap,call};
 use ic_cdk_macros::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use ic_ledger_types::{
-    AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,
+    AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,account_balance, AccountBalanceArgs, Tokens
 };
 use ic_cdk::api::management_canister::main::raw_rand;
 use ic_cdk::id;
@@ -91,6 +91,8 @@ struct StakingPool {
     }
 }
 
+
+
 fn validate_deposit_args(args: &DepositArgs) -> Result<()> {
     if args.amount < MIN_DEPOSIT || args.amount > MAX_DEPOSIT {
         return Err(StakingError::InvalidAmount);
@@ -99,6 +101,48 @@ fn validate_deposit_args(args: &DepositArgs) -> Result<()> {
 }
 thread_local! {
     static STATE: RefCell<StakingPool> = RefCell::new(StakingPool::default());
+}
+
+async fn get_balance(subaccount: Subaccount) -> u64 {
+    let account = get_account_identifier(subaccount);
+    let balance_args = AccountBalanceArgs { account };
+    
+    match call(ICP_LEDGER_CANISTER_ID, "account_balance", (balance_args,)).await {
+        Ok((tokens,)): std::result::Result<(Tokens,), _> => tokens.e8s(),
+        Err(_) => 0,
+    }
+}
+
+
+impl StakingPool {
+    fn find_stake_by_id(&self, user: &Principal, stake_id: u64) -> Option<(usize, Stake)> {
+        self.stakes.get(user)?
+            .iter()
+            .enumerate()
+            .find(|(_, stake)| stake.id == stake_id)
+            .map(|(idx, stake)| (idx, stake.clone()))
+    }
+}
+
+#[update]
+async fn confirm_deposit(stake_id: u64) -> Result<String> {
+    let user = caller();
+    
+    let (_, stake) = STATE.with(|state| {
+        let state_ref = state.borrow();
+        state_ref.find_stake_by_id(&user, stake_id)
+            .ok_or(StakingError::StakeNotFound)
+    })?;
+
+    let balance = get_balance(stake.subaccount).await;
+    if balance < stake.amount {
+        return Err(StakingError::InsufficientFunds);
+    }
+
+    Ok(format!(
+        "Deposit confirmed for stake ID: {}. Amount: {} e8s",
+        stake_id, stake.amount
+    ))
 }
 
 // Add to Stake struct
