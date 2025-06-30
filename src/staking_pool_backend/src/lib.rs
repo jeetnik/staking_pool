@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use ic_ledger_types::{
     AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,
 };
+use ic_cdk::api::management_canister::main::raw_rand;
 use ic_cdk::id;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -58,6 +59,16 @@ pub struct Stake {
 pub struct DepositArgs {
     pub amount: u64,
     pub lock_period: LockPeriod,
+}
+async fn get_random_nonce() -> u64 {
+    match raw_rand().await {
+        Ok((random_bytes,)) => {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&random_bytes[..8]);
+            u64::from_be_bytes(bytes)
+        }
+        Err(_) => get_current_time() + (caller().as_slice()[0] as u64),
+    }
 }
 
 type Result<T> = std::result::Result<T, StakingError>;
@@ -114,6 +125,44 @@ pub struct Stake {
 
 fn get_account_identifier(subaccount: Subaccount) -> AccountIdentifier {
     AccountIdentifier::new(&id(), &subaccount)
+}
+
+#[update]
+async fn deposit(args: DepositArgs) -> Result<(String, u64)> {
+    let user = caller();
+    let current_time = get_current_time();
+    
+    validate_deposit_args(&args)?;
+
+    let nonce = get_random_nonce().await;
+    let subaccount = generate_subaccount(user, nonce);
+    let account_id = get_account_identifier(subaccount);
+    let unlock_time = current_time + args.lock_period.to_seconds();
+    
+    let stake = Stake {
+        id: 0,
+        amount: args.amount,
+        lock_period: args.lock_period,
+        deposit_time: current_time,
+        unlock_time,
+        subaccount,
+        is_active: true,
+    };
+
+    let stake_id = STATE.with(|state| {
+        let mut state_ref = state.borrow_mut();
+        let stake_id = state_ref.next_stake_id;
+        state_ref.add_stake(user, stake);
+        stake_id
+    });
+
+    Ok((
+        format!(
+            "Stake created with ID: {}. Transfer {} e8s to: {}",
+            stake_id, args.amount, account_id
+        ),
+        stake_id
+    ))
 }
 #[update]
 async fn create_stake(args: DepositArgs) -> Result<String> {
