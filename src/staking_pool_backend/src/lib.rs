@@ -3,8 +3,16 @@ use ic_cdk::{caller, trap};
 use ic_cdk_macros::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use ic_ledger_types::{
+    AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,
+};
+use ic_cdk::id;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ICP_LEDGER_CANISTER_ID: Principal = MAINNET_LEDGER_CANISTER_ID;
 
 const MIN_DEPOSIT: u64 = 100_000; // 0.001 ICP
 const MAX_DEPOSIT: u64 = 100_000_000_000; // 1000 ICP
@@ -81,6 +89,32 @@ fn validate_deposit_args(args: &DepositArgs) -> Result<()> {
 thread_local! {
     static STATE: RefCell<StakingPool> = RefCell::new(StakingPool::default());
 }
+
+// Add to Stake struct
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct Stake {
+    pub id: u64,
+    pub amount: u64,
+    pub lock_period: LockPeriod,
+    pub deposit_time: u64,
+    pub unlock_time: u64,
+    pub subaccount: Subaccount, // New field
+    pub is_active: bool,
+}fn generate_subaccount(user: Principal, nonce: u64) -> Subaccount {
+    let mut hasher = DefaultHasher::new();
+    user.hash(&mut hasher);
+    nonce.hash(&mut hasher);
+    
+    let hash = hasher.finish();
+    let mut subaccount = [0u8; 32];
+    subaccount[..8].copy_from_slice(&hash.to_be_bytes());
+    subaccount[8..16].copy_from_slice(&nonce.to_be_bytes());
+    subaccount
+}
+
+fn get_account_identifier(subaccount: Subaccount) -> AccountIdentifier {
+    AccountIdentifier::new(&id(), &subaccount)
+}
 #[update]
 async fn create_stake(args: DepositArgs) -> Result<String> {
     let user = caller();
@@ -134,5 +168,12 @@ fn get_time_until_unlock(user: Principal, stake_id: u64) -> Option<u64> {
         }
         None
     })
+}
+
+#[query]
+fn get_account_identifier_for_deposit(user: Principal, nonce: u64) -> String {
+    let subaccount = generate_subaccount(user, nonce);
+    let account_id = get_account_identifier(subaccount);
+    account_id.to_string()
 }
 ic_cdk::export_candid!();
