@@ -424,6 +424,73 @@ async fn reward_pool(amount: u64) -> Result<String> {
 }
 
 #[update]
+async fn slash_pool(amount: u64, receiver: Principal) -> Result<String> {
+    if amount == 0 {
+        return Err(StakingError::InvalidAmount);
+    }
+
+    if receiver == Principal::anonymous() {
+        return Err(StakingError::InvalidReceiver);
+    }
+
+    let total_staked = STATE.with(|state| state.borrow().get_total_staked_amount());
+    
+    if total_staked == 0 {
+        return Err(StakingError::InvalidAmount);
+    }
+
+    let all_stakes = STATE.with(|state| state.borrow().get_all_active_stakes());
+    let mut total_slashed = 0u64;
+    let mut successful_slashes = 0usize;
+
+    // Proportionally reduce stake amounts
+    for (user_principal, stake) in &all_stakes {
+        let slash_amount = (stake.amount * amount) / total_staked;
+        let actual_slash = slash_amount.min(stake.amount);
+        
+        if actual_slash > 0 {
+            STATE.with(|state| {
+                let mut state_ref = state.borrow_mut();
+                if let Some(user_stakes) = state_ref.stakes.get_mut(user_principal) {
+                    if let Some(user_stake) = user_stakes.iter_mut().find(|s| s.id == stake.id) {
+                        user_stake.amount -= actual_slash;
+                        total_slashed += actual_slash;
+                        state_ref.total_pool_balance -= actual_slash;
+                        successful_slashes += 1;
+                        
+                        if user_stake.amount < MIN_DEPOSIT {
+                            user_stake.is_active = false;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Transfer slashed amount to receiver
+    if total_slashed > TRANSFER_FEE {
+        let receiver_account = AccountIdentifier::new(&receiver, &DEFAULT_SUBACCOUNT);
+        let transfer_amount = total_slashed.saturating_sub(TRANSFER_FEE);
+        
+        match transfer_icp(None, receiver_account, transfer_amount, Memo(2)).await {
+            Ok(block_index) => {
+                STATE.with(|state| {
+                    state.borrow_mut().total_slashed += total_slashed;
+                });
+                
+                Ok(format!(
+                    "Slashed {} e8s from {} stakes. Block: {}",
+                    total_slashed, successful_slashes, block_index
+                ))
+            }
+            Err(e) => Err(StakingError::TransferFailed(format!("{:?}", e))),
+        }
+    } else {
+        Err(StakingError::InvalidAmount)
+    }
+}
+
+#[update]
 async fn create_stake(args: DepositArgs) -> Result<String> {
     let user = caller();
     let current_time = get_current_time();
