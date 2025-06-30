@@ -365,7 +365,63 @@ async fn withdraw(stake_id: u64) -> Result<String> {
         Err(e) => Err(StakingError::TransferFailed(format!("{:?}", e))),
     }
 }
+#[update]
+async fn reward_pool(amount: u64) -> Result<String> {
+    if amount == 0 {
+        return Err(StakingError::InvalidAmount);
+    }
 
+    let reward_balance = get_balance(REWARD_SUBACCOUNT).await;
+    if reward_balance < amount + TRANSFER_FEE {
+        return Err(StakingError::InsufficientFunds);
+    }
+
+    let total_weighted_stake = STATE.with(|state| state.borrow().get_total_weighted_stake());
+    
+    if total_weighted_stake == 0.0 {
+        return Err(StakingError::InvalidAmount);
+    }
+
+    let all_stakes = STATE.with(|state| state.borrow().get_all_active_stakes());
+    let mut total_distributed = 0u64;
+    let mut successful_transfers = 0usize;
+
+    for (user_principal, stake) in all_stakes {
+        let weighted_stake = stake.amount as f64 * stake.lock_period.multiplier();
+        let user_reward = ((weighted_stake / total_weighted_stake) * amount as f64) as u64;
+        
+        if user_reward > TRANSFER_FEE {
+            let user_account = AccountIdentifier::new(&user_principal, &DEFAULT_SUBACCOUNT);
+            let transfer_amount = user_reward.saturating_sub(TRANSFER_FEE);
+            
+            match transfer_icp(
+                Some(REWARD_SUBACCOUNT),
+                user_account,
+                transfer_amount,
+                Memo(1),
+            ).await {
+                Ok(_) => {
+                    total_distributed += user_reward;
+                    successful_transfers += 1;
+                    
+                    STATE.with(|state| {
+                        state.borrow_mut().add_user_reward(user_principal, transfer_amount);
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    STATE.with(|state| {
+        state.borrow_mut().total_rewards_distributed += total_distributed;
+    });
+
+    Ok(format!(
+        "Distributed {} e8s to {} stakers",
+        total_distributed, successful_transfers
+    ))
+}
 
 #[update]
 async fn create_stake(args: DepositArgs) -> Result<String> {
