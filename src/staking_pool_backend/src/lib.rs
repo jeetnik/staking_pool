@@ -5,7 +5,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use ic_ledger_types::{
     AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,account_balance, AccountBalanceArgs, Tokens
-};
+    transfer, TransferArgs, TransferError, BlockIndex, Memo};
+
 use ic_cdk::api::management_canister::main::raw_rand;
 use ic_cdk::id;
 use std::collections::hash_map::DefaultHasher;
@@ -17,7 +18,7 @@ const ICP_LEDGER_CANISTER_ID: Principal = MAINNET_LEDGER_CANISTER_ID;
 
 const MIN_DEPOSIT: u64 = 100_000; // 0.001 ICP
 const MAX_DEPOSIT: u64 = 100_000_000_000; // 1000 ICP
-
+const TRANSFER_FEE: u64 = 10_000; // 0.0001 ICP
 
 const LOCK_90_DAYS: u64 = 90 * 24 * 60 * 60;
 const LOCK_180_DAYS: u64 = 180 * 24 * 60 * 60;
@@ -44,6 +45,62 @@ fn get_current_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs()
+}
+
+
+
+#[derive(CandidType, Deserialize, Debug, Clone)]
+pub enum StakingError {
+    InsufficientFunds,
+    InvalidAmount,
+    TransferFailed(String),
+    StakeNotFound,
+    StakeStillLocked,
+    StakeAlreadyWithdrawn,
+    Unauthorized,
+    InvalidLockPeriod,
+    DepositTimeout,
+    SystemError(String),
+    InvalidReceiver,
+}
+
+async fn transfer_icp(
+    from_subaccount: Option<Subaccount>,
+    to: AccountIdentifier,
+    amount: u64,
+    memo: Memo,
+) -> std::result::Result<BlockIndex, TransferError> {
+    if amount <= TRANSFER_FEE {
+        return Err(TransferError::InsufficientFunds { 
+            balance: Tokens::from_e8s(amount) 
+        });
+    }
+
+    let transfer_args = TransferArgs {
+        memo,
+        amount: Tokens::from_e8s(amount),
+        fee: Tokens::from_e8s(TRANSFER_FEE),
+        from_subaccount,
+        to,
+        created_at_time: None,
+    };
+
+    call(ICP_LEDGER_CANISTER_ID, "transfer", (transfer_args,))
+        .await
+        .map_err(|_| TransferError::TxTooOld { allowed_window_nanos: 0 })
+        .and_then(|result: (std::result::Result<BlockIndex, TransferError>,)| result.0)
+}
+
+impl StakingPool {
+    fn update_stake(&mut self, user: Principal, stake_index: usize, updater: impl FnOnce(&mut Stake)) -> bool {
+        if let Some(user_stakes) = self.stakes.get_mut(&user) {
+            if let Some(stake) = user_stakes.get_mut(stake_index) {
+                updater(stake);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -208,6 +265,60 @@ async fn deposit(args: DepositArgs) -> Result<(String, u64)> {
         stake_id
     ))
 }
+
+
+
+#[update]
+async fn withdraw(stake_id: u64) -> Result<String> {
+    let user = caller();
+    let current_time = get_current_time();
+
+    let (stake_index, stake) = STATE.with(|state| {
+        let state_ref = state.borrow();
+        state_ref.find_stake_by_id(&user, stake_id)
+            .ok_or(StakingError::StakeNotFound)
+    })?;
+
+    if !stake.is_active {
+        return Err(StakingError::StakeAlreadyWithdrawn);
+    }
+
+    if current_time < stake.unlock_time {
+        return Err(StakingError::StakeStillLocked);
+    }
+
+    let balance = get_balance(stake.subaccount).await;
+    if balance < stake.amount {
+        return Err(StakingError::InsufficientFunds);
+    }
+
+    let user_account = AccountIdentifier::new(&user, &DEFAULT_SUBACCOUNT);
+    let transfer_amount = stake.amount.saturating_sub(TRANSFER_FEE);
+    
+    match transfer_icp(
+        Some(stake.subaccount),
+        user_account,
+        transfer_amount,
+        Memo(0),
+    ).await {
+        Ok(block_index) => {
+            STATE.with(|state| {
+                let mut state_ref = state.borrow_mut();
+                state_ref.update_stake(user, stake_index, |s| {
+                    s.is_active = false;
+                });
+            });
+            
+            Ok(format!(
+                "Successfully withdrew {} e8s from stake ID: {}. Block: {}",
+                transfer_amount, stake_id, block_index
+            ))
+        }
+        Err(e) => Err(StakingError::TransferFailed(format!("{:?}", e))),
+    }
+}
+
+
 #[update]
 async fn create_stake(args: DepositArgs) -> Result<String> {
     let user = caller();
