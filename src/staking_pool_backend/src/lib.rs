@@ -48,7 +48,22 @@ fn get_current_time() -> u64 {
         .as_secs()
 }
 
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct StakingInfo {
+    pub total_staked: u64,
+    pub active_stakes: Vec<Stake>,
+    pub total_rewards_earned: u64,
+    pub pending_rewards: u64,
+}
 
+#[derive(CandidType, Deserialize, Debug)]
+pub struct PoolStats {
+    pub total_staked: u64,
+    pub total_rewards_distributed: u64,
+    pub total_slashed: u64,
+    pub total_stakers: usize,
+    pub active_stakes_count: usize,
+}
 
 #[derive(CandidType, Deserialize, Debug, Clone)]
 pub enum StakingError {
@@ -72,6 +87,31 @@ impl LockPeriod {
             LockPeriod::Days180 => 1.5,
             LockPeriod::Days360 => 2.0,
         }
+    }
+}
+impl StakingPool {
+    fn get_active_user_stakes(&self, user: &Principal) -> Vec<Stake> {
+        self.get_user_stakes(user)
+            .into_iter()
+            .filter(|stake| stake.is_active)
+            .collect()
+    }
+
+    fn get_total_staked_amount(&self) -> u64 {
+        self.stakes
+            .values()
+            .flat_map(|stakes| stakes.iter())
+            .filter(|stake| stake.is_active)
+            .map(|stake| stake.amount)
+            .sum()
+    }
+
+    fn get_active_stakes_count(&self) -> usize {
+        self.stakes
+            .values()
+            .flat_map(|stakes| stakes.iter())
+            .filter(|stake| stake.is_active)
+            .count()
     }
 }
 
@@ -556,5 +596,45 @@ fn get_account_identifier_for_deposit(user: Principal, nonce: u64) -> String {
     let subaccount = generate_subaccount(user, nonce);
     let account_id = get_account_identifier(subaccount);
     account_id.to_string()
+}
+
+#[query]
+fn get_staking_info(user: Principal) -> StakingInfo {
+    STATE.with(|state| {
+        let state_ref = state.borrow();
+        let stakes = state_ref.get_active_user_stakes(&user);
+        let total_staked = stakes.iter().map(|s| s.amount).sum();
+        let total_rewards_earned = state_ref.get_user_rewards(&user);
+        
+        StakingInfo {
+            total_staked,
+            active_stakes: stakes,
+            total_rewards_earned,
+            pending_rewards: 0,
+        }
+    })
+}
+
+#[query]
+fn get_pool_stats() -> PoolStats {
+    STATE.with(|state| {
+        let state_ref = state.borrow();
+        PoolStats {
+            total_staked: state_ref.get_total_staked_amount(),
+            total_rewards_distributed: state_ref.total_rewards_distributed,
+            total_slashed: state_ref.total_slashed,
+            total_stakers: state_ref.stakes.len(),
+            active_stakes_count: state_ref.get_active_stakes_count(),
+        }
+    })
+}
+
+#[query]
+fn get_stake_by_id(user: Principal, stake_id: u64) -> Option<Stake> {
+    STATE.with(|state| {
+        let state_ref = state.borrow();
+        state_ref.find_stake_by_id(&user, stake_id)
+            .map(|(_, stake)| stake)
+    })
 }
 ic_cdk::export_candid!();
