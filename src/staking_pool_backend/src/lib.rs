@@ -123,7 +123,29 @@ struct StakingPool {
     next_stake_id: u64,
     reward_pool_balance: u64,
 }
+impl StakingPool {
+    fn get_user_stakes(&self, user: &Principal) -> Vec<Stake> {
+        self.stakes.get(user).cloned().unwrap_or_default()
+    }
 
+    fn get_user_rewards(&self, user: &Principal) -> u64 {
+        self.user_rewards.get(user).copied().unwrap_or(0)
+    }
+}
+
+impl Default for StakingPool {
+    fn default() -> Self {
+        Self {
+            stakes: HashMap::new(),
+            user_rewards: HashMap::new(),
+            total_pool_balance: 0,
+            total_rewards_distributed: 0,
+            total_slashed: 0,
+            next_stake_id: 0,
+            reward_pool_balance: 0,
+        }
+    }
+}
 impl StakingPool {
     fn get_total_weighted_stake(&self) -> f64 {
         self.stakes
