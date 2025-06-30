@@ -4,13 +4,14 @@ use ic_cdk_macros::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use ic_ledger_types::{
-    AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,account_balance, AccountBalanceArgs, Tokens
+    AccountIdentifier, Subaccount, DEFAULT_SUBACCOUNT, MAINNET_LEDGER_CANISTER_ID,account_balance, AccountBalanceArgs, Tokens,
     transfer, TransferArgs, TransferError, BlockIndex, Memo};
 
 use ic_cdk::api::management_canister::main::raw_rand;
 use ic_cdk::id;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,7 +20,7 @@ const ICP_LEDGER_CANISTER_ID: Principal = MAINNET_LEDGER_CANISTER_ID;
 const MIN_DEPOSIT: u64 = 100_000; // 0.001 ICP
 const MAX_DEPOSIT: u64 = 100_000_000_000; // 1000 ICP
 const TRANSFER_FEE: u64 = 10_000; // 0.0001 ICP
-
+const REWARD_SUBACCOUNT: [u8; 32] = [1u8; 32];
 const LOCK_90_DAYS: u64 = 90 * 24 * 60 * 60;
 const LOCK_180_DAYS: u64 = 180 * 24 * 60 * 60;
 const LOCK_360_DAYS: u64 = 360 * 24 * 60 * 60;
@@ -63,6 +64,53 @@ pub enum StakingError {
     SystemError(String),
     InvalidReceiver,
 }
+
+impl LockPeriod {
+    fn multiplier(&self) -> f64 {
+        match self {
+            LockPeriod::Days90 => 1.0,
+            LockPeriod::Days180 => 1.5,
+            LockPeriod::Days360 => 2.0,
+        }
+    }
+}
+
+struct StakingPool {
+    stakes: HashMap<Principal, Vec<Stake>>,
+    user_rewards: HashMap<Principal, u64>,
+    total_pool_balance: u64,
+    total_rewards_distributed: u64,
+    next_stake_id: u64,
+    reward_pool_balance: u64,
+}
+
+impl StakingPool {
+    fn get_total_weighted_stake(&self) -> f64 {
+        self.stakes
+            .values()
+            .flat_map(|stakes| stakes.iter())
+            .filter(|stake| stake.is_active)
+            .map(|stake| stake.amount as f64 * stake.lock_period.multiplier())
+            .sum()
+    }
+
+    fn get_all_active_stakes(&self) -> Vec<(Principal, Stake)> {
+        self.stakes
+            .iter()
+            .flat_map(|(user, stakes)| {
+                stakes.iter()
+                    .filter(|stake| stake.is_active)
+                    .map(move |stake| (*user, stake.clone()))
+            })
+            .collect()
+    }
+
+    fn add_user_reward(&mut self, user: Principal, amount: u64) {
+        *self.user_rewards.entry(user).or_insert(0) += amount;
+    }
+}
+
+
 
 async fn transfer_icp(
     from_subaccount: Option<Subaccount>,
@@ -373,6 +421,12 @@ fn get_time_until_unlock(user: Principal, stake_id: u64) -> Option<u64> {
         None
     })
 }
+#[query]
+fn get_reward_pool_account() -> String {
+    let account_id = get_account_identifier(REWARD_SUBACCOUNT);
+    account_id.to_string()
+}
+
 
 #[query]
 fn get_account_identifier_for_deposit(user: Principal, nonce: u64) -> String {
